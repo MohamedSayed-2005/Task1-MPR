@@ -15,7 +15,7 @@ The Advanced MPR Viewer is a Python-based tool for visualizing and interacting w
 
 ## Requirements
 - Python 3.7+
-- Dependencies (see [requirements.txt](#requirements))
+- Dependencies (see [requirements.txt](#requirements.txt))
 
 ## Installation
 1. Clone this repository:
