@@ -20,5 +20,5 @@ The Advanced MPR Viewer is a Python-based tool for visualizing and interacting w
 ## Installation
 1. Clone this repository:
    ```bash
-   git clone https://github.com/yr repo/AdvancedMPRViewer.git
+   git clone https://github.com/Task1-MPR/AdvancedMPRViewer.git
    cd AdvancedMPRViewer
