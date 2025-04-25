@@ -1,445 +1,508 @@
 import sys
+import os
 import numpy as np
+import pydicom
 import nibabel as nib
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QFileDialog, QSlider, QLabel, QToolBar, QAction,
+                             QDockWidget, QListWidget, QSplitter, QFrame, QComboBox, QMessageBox)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QIcon
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from PyQt5.QtWidgets import (QApplication, QVBoxLayout, QWidget, QHBoxLayout,
-                             QLabel, QPushButton, QSpacerItem, QSizePolicy, QFileDialog,
-                             QSlider, QComboBox)
-from PyQt5.QtCore import Qt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 import vtk
-from vtk.util import numpy_support # type: ignore
+from vtk.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
-class MPRViewer(QWidget):
+class MPRViewer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.data = None
-        self.slices = [0, 0, 0]
-        self.marked_points = [[], [], []]
-        self.zoom_level = 1.0
-        self.brightness = 0
-        self.contrast = 1
-        self.panning = False
-        self.pan_start = None
-        self.current_colormap = 'gray'
-
         self.initUI()
+        self.volume = None
+        self.current_slices = [0, 0, 0]
+        self.playing = [False, False, False]
+        self.point = None
+        self.timers = [QTimer(self) for _ in range(3)]
+        for timer in self.timers:
+            timer.timeout.connect(self.update_cine)
+        self.brightness = [0, 0, 0]
+        self.contrast = [1, 1, 1]
+        self.current_folder = None
+        self.file_list = []
+        self.zoom_factors = [1, 1, 1]
+        self.pan_offset = [[0, 0], [0, 0], [0, 0]]
+        self.last_pos = [None, None, None]
+        self.is_panning = [False, False, False]
+        self.pointer_mode = False
 
     def initUI(self):
-        self.setWindowTitle('MultiPlanar Reconstruction Viewer')
-        self.main_layout = QHBoxLayout()
+        self.setWindowTitle('Advanced MPR Viewer')
+        self.setGeometry(100, 100, 1300, 800)
 
-        # Left side: Views (3/4 of the width)
-        views_layout = QVBoxLayout()
+        # Create main widget and layout
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
 
-        # Create a horizontal layout for the Axial and Sagittal views
-        h_layout_top = QHBoxLayout()
+        # Create left panel for controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
 
-        # Variable to track dragging status
-        self.dragging = False
+        # Add Cine controls for each viewer
+        self.cine_buttons = []
+        for i in range(3):
+            viewer_controls = QVBoxLayout()
+            label = QLabel(f"Viewer {i + 1} Controls")
+            viewer_controls.addWidget(label)
 
-        # Create a vertical layout for the Axial View
-        axial_layout = QVBoxLayout()
-        self.axial_canvas = self.create_canvas(0)
-        axial_label = QLabel("Axial View")
-        axial_label.setAlignment(Qt.AlignCenter)
-        axial_layout.addWidget(axial_label)
-        axial_layout.addWidget(self.axial_canvas)
-        
-        h_layout_top.addLayout(axial_layout)
+            play_button = QPushButton("Play")
+            play_button.clicked.connect(lambda _, idx=i: self.toggle_play(idx))
+            viewer_controls.addWidget(play_button)
 
-        # Create a vertical layout for the Sagittal View
-        sagittal_layout = QVBoxLayout()
-        self.sagittal_canvas = self.create_canvas(2)
-        sagittal_label = QLabel("Sagittal View")
-        sagittal_label.setAlignment(Qt.AlignCenter)
-        sagittal_layout.addWidget(sagittal_label)
-        sagittal_layout.addWidget(self.sagittal_canvas)
-        
-        h_layout_top.addLayout(sagittal_layout)
+            stop_button = QPushButton("Stop")
+            stop_button.clicked.connect(lambda _, idx=i: self.stop_cine(idx))
+            viewer_controls.addWidget(stop_button)
 
-        views_layout.addLayout(h_layout_top)
+            slider = QSlider(Qt.Horizontal)
+            slider.setMinimum(0)
+            slider.setMaximum(100)
+            slider.valueChanged.connect(lambda value, idx=i: self.update_slice_from_slider(idx, value))
+            viewer_controls.addWidget(slider)
 
-        # Coronal View (below Axial and Sagittal)
-        coronal_layout = QVBoxLayout()
-        self.coronal_canvas = self.create_canvas(1)
-        coronal_label = QLabel("Coronal View")
-        coronal_label.setAlignment(Qt.AlignCenter)
-        coronal_layout.addWidget(coronal_label)
-        coronal_layout.addWidget(self.coronal_canvas)
-        
-        views_layout.addLayout(coronal_layout)
+            brightness_label = QLabel("Brightness:")
+            viewer_controls.addWidget(brightness_label)
+            brightness_slider = QSlider(Qt.Horizontal)
+            brightness_slider.setMinimum(-100)
+            brightness_slider.setMaximum(100)
+            brightness_slider.setValue(0)
+            brightness_slider.valueChanged.connect(lambda value, idx=i: self.update_brightness(idx, value))
+            viewer_controls.addWidget(brightness_slider)
 
-        views_widget = QWidget()
-        views_widget.setLayout(views_layout)
-        self.main_layout.addWidget(views_widget, 3)  # Allocate 3 parts to views
+            contrast_label = QLabel("Contrast:")
+            viewer_controls.addWidget(contrast_label)
+            contrast_slider = QSlider(Qt.Horizontal)
+            contrast_slider.setMinimum(1)
+            contrast_slider.setMaximum(300)
+            contrast_slider.setValue(100)
+            contrast_slider.valueChanged.connect(lambda value, idx=i: self.update_contrast(idx, value))
+            viewer_controls.addWidget(contrast_slider)
 
-        # Right side: Controls (1/4 of the width)
-        controls_layout = QVBoxLayout()
+            self.cine_buttons.append((play_button, stop_button, slider, brightness_slider, contrast_slider))
+            left_layout.addLayout(viewer_controls)
 
-        # Button to open NIfTI file
-        self.open_button = QPushButton('Open NIfTI File')
-        self.open_button.clicked.connect(self.open_file)
-        controls_layout.addWidget(self.open_button)
+        # Add rendering mode selector
+        render_mode_label = QLabel("3D Rendering Mode:")
+        left_layout.addWidget(render_mode_label)
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItems(["Surface", "Volume"])
+        self.render_mode_combo.currentIndexChanged.connect(self.change_render_mode)
+        left_layout.addWidget(self.render_mode_combo)
 
-        # Button to trigger volume rendering
-        self.volume_render_button = QPushButton('Show Volume Rendering')
-        self.volume_render_button.clicked.connect(self.show_volume_rendering)
-        controls_layout.addWidget(self.volume_render_button)
+        left_layout.addStretch()
 
-        # Add Point checkbox
-        self.add_point_button = QPushButton('Add Point')
-        self.add_point_button.setCheckable(True)
-        self.add_point_button.setChecked(False)
-        controls_layout.addWidget(self.add_point_button)
+        # Create viewers layout
+        viewers_widget = QWidget()
+        viewers_layout = QVBoxLayout(viewers_widget)
 
-        # Create sliders for brightness and contrast
-        brightness_layout = QVBoxLayout()
-        brightness_layout.addWidget(QLabel("Brightness:"))
-        self.brightness_slider = QSlider(Qt.Horizontal)
-        self.brightness_slider.setMinimum(-100)
-        self.brightness_slider.setMaximum(100)
-        self.brightness_slider.setValue(0)
-        self.brightness_slider.valueChanged.connect(self.update_brightness_contrast)
-        brightness_layout.addWidget(self.brightness_slider)
-        controls_layout.addLayout(brightness_layout)
+        # Create splitter for flexible layout
+        splitter = QSplitter(Qt.Vertical)
+        viewers_layout.addWidget(splitter)
 
-        contrast_layout = QVBoxLayout()
-        contrast_layout.addWidget(QLabel("Contrast:"))
-        self.contrast_slider = QSlider(Qt.Horizontal)
-        self.contrast_slider.setMinimum(1)
-        self.contrast_slider.setMaximum(200)
-        self.contrast_slider.setValue(100)
-        self.contrast_slider.valueChanged.connect(self.update_brightness_contrast)
-        contrast_layout.addWidget(self.contrast_slider)
-        controls_layout.addLayout(contrast_layout)
+        # Create top row with two viewers
+        top_row = QSplitter(Qt.Horizontal)
+        self.viewers = []
+        for i in range(2):
+            viewer_frame = QFrame()
+            viewer_frame.setFrameStyle(QFrame.StyledPanel)
+            viewer_layout = QVBoxLayout(viewer_frame)
+            fig = Figure(figsize=(5, 5), dpi=100)
+            canvas = FigureCanvas(fig)
+            ax = fig.add_subplot(111)
+            self.viewers.append((fig, canvas, ax))
+            viewer_layout.addWidget(canvas)
+            top_row.addWidget(viewer_frame)
 
-        # Add a stretch to push controls to the top
-        controls_layout.addStretch(1)
+        splitter.addWidget(top_row)
 
-        controls_widget = QWidget()
-        controls_widget.setLayout(controls_layout)
-        self.main_layout.addWidget(controls_widget, 1)  # Allocate 1 part to controls
+        # Create bottom row with 3D view and another 2D viewer
+        bottom_row = QSplitter(Qt.Horizontal)
 
-        self.setLayout(self.main_layout)
-        
-        # Add Colormap selection dropdown
-        colormap_layout = QVBoxLayout()
-        colormap_layout.addWidget(QLabel("Colormap:"))
-        self.colormap_combo = QComboBox()
-        self.colormap_combo.addItems(['gray', 'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet'])
-        self.colormap_combo.currentTextChanged.connect(self.update_colormap)
-        colormap_layout.addWidget(self.colormap_combo)
-        controls_layout.addLayout(colormap_layout)
+        # 3D viewer
+        vtk_frame = QFrame()
+        vtk_frame.setFrameStyle(QFrame.StyledPanel)
+        vtk_layout = QVBoxLayout(vtk_frame)
+        self.frame = QVTKRenderWindowInteractor()
+        self.vtkWidget = self.frame
+        self.ren = vtk.vtkRenderer()
+        self.vtkWidget.GetRenderWindow().AddRenderer(self.ren)
+        self.iren = self.vtkWidget.GetRenderWindow().GetInteractor()
+        vtk_layout.addWidget(self.vtkWidget)
+        bottom_row.addWidget(vtk_frame)
 
-        # Add Pan button
-        self.pan_button = QPushButton('Pan')
-        self.pan_button.setCheckable(True)
-        self.pan_button.setChecked(False)
-        controls_layout.addWidget(self.pan_button)
-        
-        # Initialize slices to the center
-        self.update_slices_to_center()
+        # Third 2D viewer
+        viewer_frame = QFrame()
+        viewer_frame.setFrameStyle(QFrame.StyledPanel)
+        viewer_layout = QVBoxLayout(viewer_frame)
+        fig = Figure(figsize=(5, 5), dpi=100)
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111)
+        self.viewers.append((fig, canvas, ax))
+        viewer_layout.addWidget(canvas)
+        bottom_row.addWidget(viewer_frame)
+        splitter.addWidget(bottom_row)
+       
 
-    def update_colormap(self, colormap_name):
-        self.current_colormap = colormap_name
-        self.update_views()
-    
-    def update_brightness_contrast(self):
-        self.brightness = self.brightness_slider.value() / 100.0
-        self.contrast = self.contrast_slider.value() / 100.0
-        self.update_views()
+        # Set equal sizes for all views
+        splitter.setSizes([int(self.height()/2), int(self.height()/2)])
+        top_row.setSizes([int(self.width()/2), int(self.width()/2)])
+        bottom_row.setSizes([int(self.width()/2), int(self.width()/2)])
 
-    def open_file(self):
-        """Open a NIfTI file and load its data."""
+        # Add layouts to main layout تغيير عرض ال left tool bar
+        main_layout.addWidget(left_panel, 1)
+        main_layout.addWidget(viewers_widget, 4)
+
+        # Add file list widget
+        self.file_list_widget = QListWidget()
+        self.file_list_widget.itemClicked.connect(self.load_selected_file)
+        file_dock = QDockWidget("Files", self)
+        file_dock.setWidget(self.file_list_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, file_dock)
+
+        # Create menu bar
+        self.create_menu_bar()
+
+        # Create toolbar
+        self.create_toolbar()
+
+        # Create status bar
+        self.statusBar().showMessage('Ready')
+
+        # Initialize VTK
+        self.iren.Initialize()
+
+        # Connect events
+        for i, (fig, canvas, _) in enumerate(self.viewers):
+            fig.canvas.mpl_connect('scroll_event', lambda event, i=i: self.on_scroll(event, i))
+            fig.canvas.mpl_connect('button_press_event', lambda event, i=i: self.on_press(event, i))
+            fig.canvas.mpl_connect('motion_notify_event', lambda event, i=i: self.on_motion(event, i))
+            fig.canvas.mpl_connect('button_release_event', lambda event, i=i: self.on_release(event, i))
+
+    def create_menu_bar(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu('File')
+
+        load_action = QAction('Load Folder', self)
+        load_action.triggered.connect(self.load_data)
+        file_menu.addAction(load_action)
+
+    def create_toolbar(self):
+        toolbar = QToolBar()
+        self.addToolBar(toolbar)
+
+        load_action = QAction(QIcon('icon_load.png'), 'Load Folder', self)
+        load_action.triggered.connect(self.load_data)
+        toolbar.addAction(load_action)
+
+        # Add pointer tool button
+        self.pointer_action = QAction(QIcon('icon_pointer.png'), 'Pointer Tool', self)
+        self.pointer_action.setCheckable(True)
+        self.pointer_action.triggered.connect(self.toggle_pointer_tool)
+        toolbar.addAction(self.pointer_action)
+
+    def toggle_pointer_tool(self, checked):
+        self.pointer_mode = checked
+        self.statusBar().showMessage('Pointer tool ' + ('activated' if checked else 'deactivated'))
+
+    def load_data(self):
         options = QFileDialog.Options()
-        file_name, _ = QFileDialog.getOpenFileName(self, "Open NIfTI File", "", "NIfTI Files (*.nii *.nii.gz)", options=options)
-        if file_name:
-            self.load_nifti(file_name)
+        options |= QFileDialog.ReadOnly
+        folder_path = QFileDialog.getExistingDirectory(self, "Select Folder Containing DICOM or NIfTI files", options=options)
+        if folder_path:
+            self.current_folder = folder_path
+            self.load_folder(folder_path)
 
-    def load_nifti(self, nifti_file):
-        self.nifti_img = nib.load(nifti_file)
-        self.data = self.nifti_img.get_fdata()
+    def load_folder(self, folder_path):
+        self.file_list = []
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                if file.lower().endswith(('.dcm', '.nii', '.nii.gz')):
+                    self.file_list.append(os.path.join(root, file))
         
-        # Initialize slices to the middle of each dimension
-        self.slices = [dim // 2 for dim in self.data.shape]
-        
-        self.update_views()
+        if not self.file_list:
+            QMessageBox.warning(self, "Error", "No DICOM or NIfTI files found in the selected folder.")
+            return
 
-    def update_slices_to_center(self):
-        """Set the slices to the center of the data."""
-        if self.data is not None:
-            self.slices = [self.data.shape[2] // 2, self.data.shape[1] // 2, self.data.shape[0] // 2]
+        self.update_file_list_widget()
+        self.load_first_file()
 
-    def create_canvas(self, index):
-        """Create a matplotlib canvas for the view."""
-        fig = plt.figure(figsize=(5, 5))
-        canvas = fig.canvas
+    def update_file_list_widget(self):
+        self.file_list_widget.clear()
+        for file_path in self.file_list:
+            self.file_list_widget.addItem(os.path.basename(file_path))
 
-        # Set up mouse events for click and drag
-        canvas.mpl_connect('button_press_event', lambda event: self.on_mouse_press(event, index))
-        canvas.mpl_connect('motion_notify_event', lambda event: self.on_mouse_drag(event, index))
-        canvas.mpl_connect('button_release_event', lambda event: self.on_mouse_release(event))
-        
-        # Connect the scroll event to the wheel_zoom function
-        canvas.mpl_connect('scroll_event', lambda event: self.wheel_zoom(event, index))
+    def load_first_file(self):
+        if self.file_list:
+            first_file = self.file_list[0]
+            if first_file.lower().endswith('.dcm'):
+                self.load_dicom(os.path.dirname(first_file))
+            else:
+                self.load_nifti(first_file)
 
-        return canvas
-
-
-    def add_point(self, event, view_index):
-        """Add a point to the marked_points list when clicked in the appropriate view."""
-        if event.xdata is None or event.ydata is None:
-            return  # Ensure click is inside the canvas
-
-        # Clear previous points in all views
-        self.marked_points = [[], [], []]  # Reset points for Axial, Coronal, and Sagittal views
-
-        # Convert click coordinates to integers
-        x, y = int(round(event.xdata)), int(round(event.ydata))
-
-        # Ensure coordinates are within the image dimensions
-        if view_index == 0:  # Axial view
-            x = min(max(x, 0), self.data.shape[0] - 1)
-            y = min(max(y, 0), self.data.shape[1] - 1)
-            self.marked_points[0].append([x, y])
-            # Reflect on Coronal and Sagittal views
-            self.marked_points[1].append([x, self.slices[1]])
-            self.marked_points[2].append([y, self.slices[2]])
-        elif view_index == 1:  # Coronal view
-            x = min(max(x, 0), self.data.shape[0] - 1)
-            y = min(max(y, 0), self.data.shape[2] - 1)
-            self.marked_points[0].append([x, self.slices[0]])
-            self.marked_points[1].append([x, y])
-            self.marked_points[2].append([self.slices[1], y])
-        elif view_index == 2:  # Sagittal view
-            x = min(max(x, 0), self.data.shape[1] - 1)
-            y = min(max(y, 0), self.data.shape[2] - 1)
-            self.marked_points[0].append([self.slices[0], x])
-            self.marked_points[1].append([y, x])
-            self.marked_points[2].append([x, y])
-
-        # Update the views to reflect the added points
-        self.update_views()
-
-
-
-
-    def get_slice(self, view_index, slice_index):
-        """Get the appropriate slice based on the view index and slice index."""
-        if self.data is None:
-            return None
-
-        # Ensure slice_index is within valid bounds
-        max_slice = self.data.shape[view_index] - 1
-        slice_index = min(max(slice_index, 0), max_slice)
-
-        if view_index == 0:  # Axial
-            slice_data = self.data[:, :, slice_index]
-        elif view_index == 1:  # Coronal
-            slice_data = self.data[:, slice_index, :]
-        elif view_index == 2:  # Sagittal
-            slice_data = self.data[slice_index, :, :]
+    def load_selected_file(self, item):
+        file_path = os.path.join(self.current_folder, item.text())
+        if file_path.lower().endswith('.dcm'):
+            self.load_dicom(os.path.dirname(file_path))
         else:
-            return None
+            self.load_nifti(file_path)
+
+    def load_dicom(self, folder):
+        slices = []
+        dicom_files = [f for f in os.listdir(folder) if f.lower().endswith('.dcm')]
+        for s in dicom_files:
+            try:
+                ds = pydicom.dcmread(os.path.join(folder, s))
+                slices.append(ds)
+            except:
+                pass
+        if not slices:
+            QMessageBox.warning(self, "Error", "No valid DICOM files found in the selected folder.")
+            return
+        slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
+        self.volume = np.stack([s.pixel_array for s in slices])
+        self.update_viewers()
+        self.update_3d_view()
+        self.statusBar().showMessage(f'Loaded {len(slices)} DICOM slices')
+
+    def load_nifti(self, file_path):
+        try:
+            nii = nib.load(file_path)
+            self.volume = nii.get_fdata()
+            self.update_viewers()
+            self.update_3d_view()
+            self.statusBar().showMessage(f'Loaded NIfTI file: {os.path.basename(file_path)}')
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load NIfTI file: {str(e)}")
+
+    def update_viewers(self):
+        if self.volume is not None:
+            for i in range(3):
+                self.update_slice(i, self.current_slices[i])
+                self.cine_buttons[i][2].setMaximum(self.volume.shape[i] - 1)
+
+    def update_slice(self, viewer_index, slice_index):
+        if self.volume is None:
+            return
+
+        self.current_slices[viewer_index] = slice_index
+        fig, canvas, ax = self.viewers[viewer_index]
+        ax.clear()
+
+        if viewer_index == 0:
+            img = self.volume[slice_index, :, :]
+        elif viewer_index == 1:
+            img = self.volume[:, slice_index, :]
+        else:
+            img = self.volume[:, :, slice_index]
 
         # Apply brightness and contrast
-        slice_min = np.min(slice_data)
-        slice_max = np.max(slice_data)
+        img = self.apply_brightness_contrast(img, viewer_index)
+
+        ax.imshow(img, cmap='gray', aspect='equal', interpolation='nearest')
+        ax.axis('off')
+
+        if self.point is not None:
+            x, y, z = self.point
+            if viewer_index == 0 and x == slice_index:
+                ax.plot(z, y, 'ro')
+            elif viewer_index == 1 and y == slice_index:
+                ax.plot(z, x, 'ro')
+            elif viewer_index == 2 and z == slice_index:
+                ax.plot(y, x, 'ro')
+
+        self.draw_crosshairs(viewer_index)
         
-        if slice_max > slice_min:
-            # Normalize only if there's a difference between max and min
-            slice_data = (slice_data - slice_min) / (slice_max - slice_min)
+        # Apply zoom and pan
+        ax.set_xlim(self.pan_offset[viewer_index][0],
+                    self.pan_offset[viewer_index][0] + img.shape[1] / self.zoom_factors[viewer_index])
+        ax.set_ylim(self.pan_offset[viewer_index][1] + img.shape[0] / self.zoom_factors[viewer_index],
+                    self.pan_offset[viewer_index][1])
+
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    def apply_brightness_contrast(self, img, viewer_index):
+        return np.clip((img - img.min()) / (img.max() - img.min()) * self.contrast[viewer_index] + self.brightness[viewer_index], 0, 1)
+
+    def draw_crosshairs(self, viewer_index):
+        _, _, ax = self.viewers[viewer_index]
+        shape = self.volume.shape
+        if viewer_index == 0:
+            ax.axhline(self.current_slices[1], color='r', alpha=0.5)
+            ax.axvline(self.current_slices[2], color='g', alpha=0.5)
+        elif viewer_index == 1:
+            ax.axhline(self.current_slices[0], color='r', alpha=0.5)
+            ax.axvline(self.current_slices[2], color='b', alpha=0.5)
         else:
-            # If all values are the same, set the entire slice to 0.5
-            slice_data = np.full_like(slice_data, 0.5)
-        
-        # Apply contrast and brightness
-        slice_data = np.clip((slice_data - 0.5) * self.contrast + 0.5 + self.brightness, 0, 1)
-        
-        return slice_data
+            ax.axhline(self.current_slices[0], color='r', alpha=0.5)
+            ax.axvline(self.current_slices[1], color='g', alpha=0.5)
 
-    
-    def on_mouse_press(self, event, view_index):
-        """Handle mouse press event to start dragging the crosshairs, add a point, or start panning."""
-        if event.inaxes is None:
+    def update_3d_view(self):
+        if self.volume is None:
             return
 
-        if self.pan_button.isChecked():
-            self.panning = True
-            self.pan_start = (event.xdata, event.ydata)
-        elif self.add_point_button.isChecked():
-            self.add_point(event, view_index)
-        else:
-            self.dragging = True
-            self.drag_start_x = event.xdata
-            self.drag_start_y = event.ydata
-            self.drag_view_index = view_index
+        # Create VTK data object
+        dataImporter = vtk.vtkImageImport()
+        data_string = self.volume.astype(np.uint8).tostring()
+        dataImporter.CopyImportVoidPointer(data_string, len(data_string))
+        dataImporter.SetDataScalarTypeToUnsignedChar()
+        dataImporter.SetNumberOfScalarComponents(1)
+        dataImporter.SetDataExtent(0, self.volume.shape[2] - 1, 0, self.volume.shape[1] - 1, 0,
+                                   self.volume.shape[0] - 1)
+        dataImporter.SetWholeExtent(0, self.volume.shape[2] - 1, 0, self.volume.shape[1] - 1, 0,
+                                    self.volume.shape[0] - 1)
 
-    def on_mouse_drag(self, event, view_index):
-        """Handle mouse drag event to update the crosshair position or pan the view."""
-        if event.inaxes is None:
-            return
+        # Create transfer mapping scalar value to opacity
+        opacityTransferFunction = vtk.vtkPiecewiseFunction()
+        opacityTransferFunction.AddPoint(20, 0.0)
+        opacityTransferFunction.AddPoint(255, 0.2)
 
-        if self.panning and self.pan_start:
-            dx = self.pan_start[0] - event.xdata
-            dy = self.pan_start[1] - event.ydata
-            
-            ax = event.inaxes
-            x_min, x_max = ax.get_xlim()
-            y_min, y_max = ax.get_ylim()
-            
-            ax.set_xlim(x_min + dx, x_max + dx)
-            ax.set_ylim(y_min + dy, y_max + dy)
-            
-            ax.figure.canvas.draw_idle()
-        elif self.dragging:
-            x, y = int(round(event.xdata)), int(round(event.ydata))
+        # Create transfer mapping scalar value to color
+        colorTransferFunction = vtk.vtkColorTransferFunction()
+        colorTransferFunction.AddRGBPoint(0.0, 0.0, 0.0, 0.0)
+        colorTransferFunction.AddRGBPoint(64.0, 1.0, 0.0, 0.0)
+        colorTransferFunction.AddRGBPoint(128.0, 0.0, 0.0, 1.0)
+        colorTransferFunction.AddRGBPoint(192.0, 0.0, 1.0, 0.0)
+        colorTransferFunction.AddRGBPoint(255.0, 1.0, 1.0, 1.0)
 
-            if view_index == 0:  # Axial view
-                self.slices[1] = min(max(y, 0), self.data.shape[1] - 1)
-                self.slices[2] = min(max(x, 0), self.data.shape[2] - 1)
-            elif view_index == 1:  # Coronal view
-                self.slices[0] = min(max(y, 0), self.data.shape[0] - 1)
-                self.slices[2] = min(max(x, 0), self.data.shape[2] - 1)
-            elif view_index == 2:  # Sagittal view
-                self.slices[0] = min(max(y, 0), self.data.shape[0] - 1)
-                self.slices[1] = min(max(x, 0), self.data.shape[1] - 1)
+        # The property describes how the data will look
+        volumeProperty = vtk.vtkVolumeProperty()
+        volumeProperty.SetColor(colorTransferFunction)
+        volumeProperty.SetScalarOpacity(opacityTransferFunction)
+        volumeProperty.ShadeOn()
+        volumeProperty.SetInterpolationTypeToLinear()
 
-            for i in range(3):
-                self.slices[i] = min(max(self.slices[i], 0), self.data.shape[i] - 1)
+        # The mapper / ray cast function know how to render the data
+        volumeMapper = vtk.vtkGPUVolumeRayCastMapper()
+        volumeMapper.SetInputConnection(dataImporter.GetOutputPort())
 
-            self.update_views()
+        # The volume holds the mapper and the property and
+        # can be used to position/orient the volume
+        self.volume_3d = vtk.vtkVolume()
+        self.volume_3d.SetMapper(volumeMapper)
+        self.volume_3d.SetProperty(volumeProperty)
 
-    def on_mouse_release(self, event):
-        """Handle mouse release event to stop dragging or panning."""
-        self.dragging = False
-        self.panning = False
-        self.pan_start = None
+        # Surface rendering
+        isoValue = 128
+        mcubes = vtk.vtkMarchingCubes()
+        mcubes.SetInputConnection(dataImporter.GetOutputPort())
+        mcubes.SetValue(0, isoValue)
 
-    def update_views(self):
-        """Update all three views."""
-        if self.data is None:
-            return
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(mcubes.GetOutputPort())
+        mapper.ScalarVisibilityOff()
 
-        views = [self.get_slice(0, self.slices[0]),
-                 self.get_slice(1, self.slices[1]),
-                 self.get_slice(2, self.slices[2])]
+        self.surface = vtk.vtkActor()
+        self.surface.SetMapper(mapper)
+        self.surface.GetProperty().SetColor(1.0, 1.0, 1.0)
 
-        for i, (view, canvas) in enumerate(zip(views, [self.axial_canvas, self.coronal_canvas, self.sagittal_canvas])):
-            canvas.figure.clear()
-            ax = canvas.figure.add_subplot(111)
+        self.ren.RemoveAllViewProps()
+        self.ren.AddVolume(self.volume_3d)
+        self.ren.AddActor(self.surface)
+        self.surface.SetVisibility(False)  # Start with volume rendering by default
+        self.ren.ResetCamera()
+        self.frame.Render()
 
-            # Display the image with appropriate zoom and colormap applied
-            im = ax.imshow(view.T, cmap=self.current_colormap, origin='lower', extent=[0, view.shape[1], 0, view.shape[0]])
-            
-            # Add colorbar
-            canvas.figure.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-
-            # Mark points
-            for point in self.marked_points[i]:
-                ax.plot(point[0], point[1], 'ro', markersize=5)  # Red points for marked points
-
-            # Crosshairs logic (now with dashed lines)
-            if i == 0:  # Axial view
-                ax.axhline(self.slices[1], color='yellow', linestyle='--')  # Horizontal dashed line (Y-axis)
-                ax.axvline(self.slices[2], color='yellow', linestyle='--')  # Vertical dashed line (X-axis)
-            elif i == 1:  # Coronal view
-                ax.axhline(self.slices[0], color='yellow', linestyle='--')  # Horizontal dashed line (X-axis)
-                ax.axvline(self.slices[2], color='yellow', linestyle='--')  # Vertical dashed line (Z-axis)
-            elif i == 2:  # Sagittal view
-                ax.axhline(self.slices[0], color='yellow', linestyle='--')  # Horizontal dashed line (X-axis)
-                ax.axvline(self.slices[1], color='yellow', linestyle='--')  # Vertical dashed line (Y-axis)
-
-            canvas.draw()
-
-
-    def show_volume_rendering(self):
-        """Display volume rendering of the NIfTI file data using VTK."""
-        if self.data is None:
-            print("No data loaded!")
-            return
-        
-        # Create a VTK image data object
-        image_data = vtk.vtkImageData()
-        image_data.SetDimensions(self.data.shape[2], self.data.shape[1], self.data.shape[0])
-
-        # Convert the NumPy array to VTK format
-        vtk_data_array = numpy_support.numpy_to_vtk(self.data.ravel(), deep=True, array_type=vtk.VTK_FLOAT)
-        image_data.GetPointData().SetScalars(vtk_data_array)
-
-        # Set up volume rendering pipeline
-        volume_mapper = vtk.vtkGPUVolumeRayCastMapper()
-        volume_mapper.SetInputData(image_data)
-
-        volume_property = vtk.vtkVolumeProperty()
-        volume_property.ShadeOn()
-        volume_property.SetInterpolationTypeToLinear()
-
-        # Set color and opacity functions
-        color_function = vtk.vtkColorTransferFunction()
-        color_function.AddRGBPoint(np.min(self.data), 0.0, 0.0, 0.0)
-        color_function.AddRGBPoint(np.max(self.data), 1.0, 1.0, 1.0)
-        volume_property.SetColor(color_function)
-
-        opacity_function = vtk.vtkPiecewiseFunction()
-        opacity_function.AddPoint(np.min(self.data), 0.0)
-        opacity_function.AddPoint(np.max(self.data), 1.0)
-        volume_property.SetScalarOpacity(opacity_function)
-
-        volume = vtk.vtkVolume()
-        volume.SetMapper(volume_mapper)
-        volume.SetProperty(volume_property)
-
-        # Renderer and window
-        renderer = vtk.vtkRenderer()
-        renderer.AddVolume(volume)
-        renderer.SetBackground(0, 0, 0)
-
-        render_window = vtk.vtkRenderWindow()
-        render_window.AddRenderer(renderer)
-
-        render_interactor = vtk.vtkRenderWindowInteractor()
-        render_interactor.SetRenderWindow(render_window)
-
-        render_window.Render()
-        render_interactor.Start()
-
-    def wheel_zoom(self, event, index):
-        """Zoom in or out based on scroll event, centered on cursor position."""
-        if event.inaxes is None:
-            return  # Ensure that the mouse is over an axes
-
-        ax = event.inaxes
-        
-        # Determine zoom factor
+    def on_scroll(self, event, viewer_index):
         if event.button == 'up':
-            scale_factor = 1.1
+            self.zoom_factors[viewer_index] *= 1.05
         elif event.button == 'down':
-            scale_factor = 1 / 1.1
-        else:
-            return  # If it's not a scroll event, do nothing
+            self.zoom_factors[viewer_index] /= 1.05
 
-        # Get the current x and y limits
-        x_min, x_max = ax.get_xlim()
-        y_min, y_max = ax.get_ylim()
-        
-        # Get mouse location in data coordinates
-        x_data = event.xdata
-        y_data = event.ydata
-        
-        # Calculate new limits
-        new_x_min = x_data - (x_data - x_min) / scale_factor
-        new_x_max = x_data + (x_max - x_data) / scale_factor
-        new_y_min = y_data - (y_data - y_min) / scale_factor
-        new_y_max = y_data + (y_max - y_data) / scale_factor
-        
-        # Set new limits
-        ax.set_xlim(new_x_min, new_x_max)
-        ax.set_ylim(new_y_min, new_y_max)
-        
-        # Redraw the canvas
-        ax.figure.canvas.draw_idle()
+        self.update_slice(viewer_index, self.current_slices[viewer_index])
+
+    def on_press(self, event, viewer_index):
+        if event.button == 1:  # Left click
+            self.last_pos[viewer_index] = (event.xdata, event.ydata)
+            if self.pointer_mode:
+                if viewer_index == 0:
+                    self.point = [self.current_slices[0], int(event.ydata), int(event.xdata)]
+                elif viewer_index == 1:
+                    self.point = [int(event.ydata), self.current_slices[1], int(event.xdata)]
+                else:
+                    self.point = [int(event.ydata), int(event.xdata), self.current_slices[2]]
+
+                self.current_slices = self.point
+                for i in range(3):
+                    self.update_slice(i, self.current_slices[i])
+                    self.cine_buttons[i][2].setValue(self.current_slices[i])
+            else:
+                self.is_panning[viewer_index] = True
+
+    def on_motion(self, event, viewer_index):
+        if self.is_panning[viewer_index] and event.inaxes and self.last_pos[viewer_index] is not None:
+            # Pan the image
+            dx = self.last_pos[viewer_index][0] - event.xdata
+            dy = self.last_pos[viewer_index][1] - event.ydata
+            self.pan_offset[viewer_index][0] += dx / self.zoom_factors[viewer_index]
+            self.pan_offset[viewer_index][1] += dy / self.zoom_factors[viewer_index]
+            self.update_slice(viewer_index, self.current_slices[viewer_index])
+
+            self.last_pos[viewer_index] = (event.xdata, event.ydata)
+
+    def on_release(self, event, viewer_index):
+        self.last_pos[viewer_index] = None
+        self.is_panning[viewer_index] = False
+
+    def toggle_play(self, viewer_index):
+        if self.playing[viewer_index]:
+            self.stop_cine(viewer_index)
+        else:
+            self.start_cine(viewer_index)
+
+    def start_cine(self, viewer_index):
+        if not self.playing[viewer_index]:
+            self.playing[viewer_index] = True
+            self.cine_buttons[viewer_index][0].setText("Pause")
+            self.timers[viewer_index].start(100)  # Update every 100 ms
+
+    def stop_cine(self, viewer_index):
+        if self.playing[viewer_index]:
+            self.playing[viewer_index] = False
+            self.cine_buttons[viewer_index][0].setText("Play")
+            self.timers[viewer_index].stop()
+
+    def update_cine(self):
+        for i in range(3):
+            if self.playing[i]:
+                max_slice = self.volume.shape[i] - 1
+                self.current_slices[i] = (self.current_slices[i] + 1) % (max_slice + 1)
+                self.update_slice(i, self.current_slices[i])
+                self.cine_buttons[i][2].setValue(self.current_slices[i])
+
+    def update_slice_from_slider(self, viewer_index, value):
+        self.current_slices[viewer_index] = value
+        self.update_slice(viewer_index, value)
+
+    def update_brightness(self, viewer_index, value):
+        self.brightness[viewer_index] = value / 100.0
+        self.update_slice(viewer_index, self.current_slices[viewer_index])
+
+    def update_contrast(self, viewer_index, value):
+        self.contrast[viewer_index] = value / 100.0
+        self.update_slice(viewer_index, self.current_slices[viewer_index])
+
+    def change_render_mode(self, index):
+        if self.volume is None:
+            return
+
+        if index == 0:  # Surface rendering
+            self.volume_3d.SetVisibility(False)
+            self.surface.SetVisibility(True)
+        else:  # Volume rendering
+            self.volume_3d.SetVisibility(True)
+            self.surface.SetVisibility(False)
+
+        self.frame.Render()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
